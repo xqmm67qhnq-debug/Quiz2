@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="ar">
+<head>
+    <meta charset="UTF-8">
+    <title>تحويل بنك أسئلة PDF إلى اختبار</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            direction: rtl;
+            margin: 20px;
+            line-height: 1.6;
+        }
+        h1, h2 {
+            text-align: center;
+        }
+        #status {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 6px;
+            background: #f0f0f0;
+            font-size: 14px;
+            white-space: pre-wrap;
+        }
+        .question {
+            margin: 15px 0;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+        }
+        .question.correct {
+            border-color: green;
+        }
+        .question.incorrect {
+            border-color: red;
+        }
+        .question-title {
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        .choice {
+            margin: 3px 0;
+        }
+        .controls {
+            margin: 15px 0;
+            text-align: center;
+        }
+        button {
+            padding: 8px 16px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+        #result {
+            font-weight: bold;
+            margin-top: 15px;
+            text-align: center;
+        }
+        .correct-answer-text {
+            margin-top: 5px;
+            font-size: 13px;
+        }
+    </style>
+    <!-- pdf.js من CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+</head>
+<body>
+    <h1>اختبار من ملف PDF</h1>
+    <div class="controls">
+        <input type="file" id="pdfFile" accept="application/pdf">
+    </div>
+    <div id="status">اختر ملف PDF يحتوي على الأسئلة وسطر Answer...</div>
+    <h2>الاختبار</h2>
+    <form id="quizForm"></form>
+    <div class="controls">
+        <button type="button" id="gradeBtn">تصحيح الاختبار</button>
+    </div>
+    <div id="result"></div>
+
+    <script>
+        const statusEl = document.getElementById('status');
+        const quizForm = document.getElementById('quizForm');
+        const fileInput = document.getElementById('pdfFile');
+        const gradeBtn = document.getElementById('gradeBtn');
+
+        let questionsGlobal = [];
+
+        // إعداد عامل pdf.js
+        if (window['pdfjsLib']) {
+            pdfjsLib.GlobalWorkerOptions.workerSrc =
+                'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+        }
+
+        fileInput.addEventListener('change', async (event) => {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            statusEl.textContent = 'جاري قراءة الملف...';
+            quizForm.innerHTML = '';
+            questionsGlobal = [];
+            document.getElementById('result').textContent = '';
+
+            try {
+                const arrayBuffer = await file.arrayBuffer();
+                const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+                const totalPages = pdf.numPages;
+                statusEl.textContent =
+                    `تم فتح الملف. عدد الصفحات: ${totalPages}\nجاري استخراج النص (قد يستغرق وقتًا قليلاً للملفات الكبيرة)...`;
+
+                let fullText = '';
+
+                // نعالج الصفحات على دفعات حتى لو 1000+ صفحة
+                const BATCH_SIZE = 10; // عدّلها لو حاب (مثلاً 20 صفحة في كل دفعة)
+                for (let start = 1; start <= totalPages; start += BATCH_SIZE) {
+                    const end = Math.min(start + BATCH_SIZE - 1, totalPages);
+
+                    for (let pageNum = start; pageNum <= end; pageNum++) {
+                        const page = await pdf.getPage(pageNum);
+                        const textContent = await page.getTextContent();
+
+                        const pageText = textContent.items
+                            .map(item => item.str)
+                            .join(' ');
+
+                        fullText += '\n' + pageText;
+                    }
+
+                    const progress = Math.round((Math.min(end, totalPages) / totalPages) * 100);
+                    statusEl.textContent =
+                        `جاري استخراج النص... (${progress}%)\nالصفحات المعالجة: ${end} من ${totalPages}`;
+
+                    // نرجع التحكم للمتصفح عشان ما يعلق مع ملفات ضخمة
+                    await new Promise(r => setTimeout(r, 0));
+                }
+
+                statusEl.textContent = 'تم استخراج النص بالكامل. جاري تحليل الأسئلة...';
+
+                const questions = parseQuestions(fullText);
+
+                if (questions.length === 0) {
+                    statusEl.textContent =
+                        'لم أستطع التعرف على أي سؤال. قد تحتاج لتعديل الكود أو تنسيق الـ PDF.';
+                    return;
+                }
+
+                questionsGlobal = questions;
+                buildQuizForm(questions);
+                statusEl.textContent =
+                    `تم توليد الاختبار. عدد الأسئلة التي تم التعرف عليها: ${questions.length}`;
+            } catch (err) {
+                console.error(err);
+                statusEl.textContent =
+                    'حدث خطأ أثناء قراءة الملف أو تحليله. افتح Console في المتصفح (F12) لرؤية التفاصيل.';
+            }
+        });
+
+        /**
+         * تحليل النص الكامل إلى أسئلة
+         * القواعد:
+         *  - أي "رقم)" (مثل 2) أو 15)) = بداية سؤال
+         *  - داخل السؤال:
+         *      A) B) C) D) E) = اختيارات
+         *      Answer: X      = الإجابة الصحيحة
+         *  - لو Answer: TRUE/FALSE → صح/خطأ
+         */
+        function parseQuestions(text) {
+            text = text.replace(/\r\n?/g, '\n');
+
+            const questions = [];
+
+            // نبحث عن بلوكات من "رقم)" إلى "الرقم التالي)" أو نهاية النص
+            const questionRegex = /(\d+\))([\s\S]*?)(?=\d+\)|$)/g;
+            let match;
+
+            while ((match = questionRegex.exec(text)) !== null) {
+                let block = (match[1] + match[2]).trim();
+                if (!block) continue;
+
+                // نزيل أي شيء بعد Difficulty: لو موجود (معلومات إضافية ما نحتاجها)
+                block = block.split(/Difficulty:/i)[0];
+
+                // رقم السؤال
+                const numMatch = block.match(/^(\d+)\)/);
+                if (!numMatch) continue;
+                const qNumber = numMatch[1];
+
+                // النص بعد رقم السؤال
+                let afterNum = block.replace(/^\d+\)/, '').trim();
+
+                // نبحث عن سطر Answer:
+                const ansMatch = afterNum.match(/Answer\s*:\s*([A-Za-z]+)/i);
+                if (!ansMatch) continue;
+                let ansRaw = ansMatch[1].trim().toUpperCase();
+
+                let correct = null;
+                let type = null;
+
+                // True/False
+                if (ansRaw === 'TRUE' || ansRaw === 'FALSE') {
+                    correct = ansRaw;
+                    type = 'TF';
+                } else {
+                    const letterMatch = ansRaw.match(/^([A-E])/);
+                    if (!letterMatch) continue;
+                    correct = letterMatch[1];
+                    type = 'MCQ';
+                }
+
+                // نص السؤال = ما قبل أول ظهور لاختيار A)/B)... أو Answer:
+                let splitIndex = afterNum.search(/(?:[A-E]\)\s|Answer\s*:)/i);
+                let questionText = '';
+                if (splitIndex === -1) {
+                    questionText = afterNum.trim();
+                } else {
+                    questionText = afterNum.slice(0, splitIndex).trim();
+                }
+
+                // لو سؤال اختيارات، نستخرج A) ... E)
+                let choices = [];
+                if (type === 'MCQ') {
+                    const choiceRegex = /([A-E])\)\s*([\s\S]*?)(?=(?:[A-E]\)\s|Answer\s*:|$))/g;
+                    let cMatch;
+                    while ((cMatch = choiceRegex.exec(afterNum)) !== null) {
+                        const key = cMatch[1];
+                        const textChoice = cMatch[2].trim().replace(/\s+/g, ' ');
+                        choices.push({ key, text: textChoice });
+                    }
+
+                    if (choices.length === 0) continue; // لو مافي اختيارات، نطنّش السؤال
+                }
+
+                questions.push({
+                    number: qNumber,
+                    text: questionText,
+                    type,
+                    choices,
+                    correct
+                });
+            }
+
+            return questions;
+        }
+
+        /**
+         * بناء نموذج الاختبار
+         */
+        function buildQuizForm(questions) {
+            quizForm.innerHTML = '';
+
+            questions.forEach((q, idx) => {
+                const qDiv = document.createElement('div');
+                qDiv.className = 'question';
+                qDiv.dataset.index = idx;
+
+                const title = document.createElement('div');
+                title.className = 'question-title';
+                title.textContent = `س${q.number}) ${q.text}`;
+                qDiv.appendChild(title);
+
+                if (q.type === 'MCQ') {
+                    q.choices.forEach(choice => {
+                        const label = document.createElement('label');
+                        label.className = 'choice';
+
+                        const input = document.createElement('input');
+                        input.type = 'radio';
+                        input.name = 'q' + idx;
+                        input.value = choice.key;
+
+                        label.appendChild(input);
+                        label.appendChild(
+                            document.createTextNode(' ' + choice.key + ') ' + choice.text)
+                        );
+                        qDiv.appendChild(label);
+                        qDiv.appendChild(document.createElement('br'));
+                    });
+                } else if (q.type === 'TF') {
+                    const tfOptions = [
+                        { value: 'TRUE', label: 'True' },
+                        { value: 'FALSE', label: 'False' }
+                    ];
+                    tfOptions.forEach(opt => {
+                        const label = document.createElement('label');
+                        label.className = 'choice';
+
+                        const input = document.createElement('input');
+                        input.type = 'radio';
+                        input.name = 'q' + idx;
+                        input.value = opt.value;
+
+                        label.appendChild(input);
+                        label.appendChild(document.createTextNode(' ' + opt.label));
+                        qDiv.appendChild(label);
+                        qDiv.appendChild(document.createElement('br'));
+                    });
+                }
+
+                const correctText = document.createElement('div');
+                correctText.className = 'correct-answer-text';
+                correctText.style.display = 'none';
+                qDiv.appendChild(correctText);
+
+                quizForm.appendChild(qDiv);
+            });
+        }
+
+        /**
+         * تصحيح الاختبار
+         */
+        gradeBtn.addEventListener('click', () => {
+            if (!questionsGlobal.length) return;
+
+            let score = 0;
+            let answered = 0;
+
+            const qDivs = quizForm.querySelectorAll('.question');
+
+            qDivs.forEach((qDiv, idx) => {
+                qDiv.classList.remove('correct', 'incorrect');
+                const q = questionsGlobal[idx];
+
+                const selected = quizForm.querySelector(`input[name="q${idx}"]:checked`);
+                const correctTextDiv = qDiv.querySelector('.correct-answer-text');
+
+                if (!selected) {
+                    correctTextDiv.style.display = 'block';
+                    correctTextDiv.textContent =
+                        `لم تجب. الإجابة الصحيحة: ${formatCorrectAnswer(q)}`;
+                    return;
+                }
+
+                answered++;
+
+                if (selected.value === q.correct) {
+                    score++;
+                    qDiv.classList.add('correct');
+                    correctTextDiv.style.display = 'block';
+                    correctTextDiv.textContent = 'إجابة صحيحة ✔';
+                } else {
+                    qDiv.classList.add('incorrect');
+                    correctTextDiv.style.display = 'block';
+                    correctTextDiv.textContent =
+                        `إجابة خاطئة ✘ – الإجابة الصحيحة: ${formatCorrectAnswer(q)}`;
+                }
+            });
+
+            const resultEl = document.getElementById('result');
+            resultEl.textContent =
+                `درجتك: ${score} من ${questionsGlobal.length} (أجبت على ${answered} سؤال).`;
+        });
+
+        function formatCorrectAnswer(q) {
+            if (q.type === 'MCQ') {
+                const choice = q.choices.find(c => c.key === q.correct);
+                if (choice) {
+                    return `${q.correct}) ${choice.text}`;
+                }
+                return q.correct;
+            } else if (q.type === 'TF') {
+                return q.correct === 'TRUE' ? 'True' : 'False';
+            }
+            return q.correct;
+        }
+    </script>
+</body>
+</html>
